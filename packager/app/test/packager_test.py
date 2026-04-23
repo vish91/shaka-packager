@@ -15,6 +15,8 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 
 import packager_app
@@ -2267,6 +2269,223 @@ class PackagerCommandParsingTest(PackagerAppTest):
             skip_byte_block=13,
             output_dash=True))
     self.assertEqual(packaging_result, 1)
+
+
+class PackagerSinglePassVodTest(PackagerAppTest):
+  """Tests for --mp4_single_pass_vod behavior.
+
+  Verifies that the default two-pass path writes intermediate temp files to
+  --temp_dir during packaging, and that --mp4_single_pass_vod eliminates those
+  temp files entirely (writing fragments directly to the output file).
+
+  Each test uses a tightly-controlled --temp_dir so we can assert precisely
+  what is (or isn't) written there.
+  """
+
+  def setUp(self):
+    super().setUp()
+    self.test_file = os.path.join(self.test_data_dir, 'bear-640x360.mp4')
+    # A directory we fully own so we can assert whether files appear in it.
+    self.monitored_tmp_dir = tempfile.mkdtemp()
+
+  def tearDown(self):
+    shutil.rmtree(self.monitored_tmp_dir, ignore_errors=True)
+    super().tearDown()
+
+  # ---------------------------------------------------------------------------
+  # Helpers
+  # ---------------------------------------------------------------------------
+
+  def _Streams(self):
+    """Return stream descriptors writing to self.tmp_dir."""
+    return [
+        'input={0},stream=video,output={1}'.format(
+            self.test_file, os.path.join(self.tmp_dir, 'video.mp4')),
+        'input={0},stream=audio,output={1}'.format(
+            self.test_file, os.path.join(self.tmp_dir, 'audio.mp4')),
+    ]
+
+  def _Flags(self, single_pass=False, encryption=False):
+    flags = [
+        '--mpd_output', self.mpd_output,
+        '--temp_dir', self.monitored_tmp_dir,
+        '--single_threaded',
+        '--segment_duration=1',
+        '--test_packager_version', '<tag>-<hash>-<test>',
+    ]
+    if single_pass:
+      flags.append('--mp4_single_pass_vod')
+    if encryption:
+      flags += [
+          '--enable_raw_key_encryption',
+          '--keys=label=:key_id={0}:key={1}'.format(
+              self.encryption_key_id, self.encryption_key),
+          '--iv=' + self.encryption_iv,
+          '--clear_lead={0}'.format(self.clear_lead),
+      ]
+    return flags
+
+  def _RunWithTempDirMonitor(self, streams, flags):
+    """Run the packager and concurrently monitor self.monitored_tmp_dir.
+
+    Returns:
+      (return_code, snapshots) where snapshots is a list of non-empty file
+      listings observed in monitored_tmp_dir while the packager was running.
+      Each snapshot is a list of filenames seen at one polling interval.
+    """
+    snapshots = []
+    stop = threading.Event()
+
+    def _monitor():
+      while not stop.is_set():
+        try:
+          entries = os.listdir(self.monitored_tmp_dir)
+          if entries:
+            snapshots.append(entries[:])
+        except OSError:
+          pass
+        time.sleep(0.005)  # 5 ms poll — fast enough to catch any real job
+
+    t = threading.Thread(target=_monitor, daemon=True)
+    t.start()
+
+    cmd = [self.packager.packager_binary] + streams + flags
+    return_code = subprocess.call(cmd, env=self.packager.GetEnv())
+
+    stop.set()
+    t.join(timeout=2.0)
+    return return_code, snapshots
+
+  def _ParseMpdIndexRange(self):
+    """Return list of (start, end) byte pairs from indexRange in the MPD."""
+    ranges = []
+    with open(self.mpd_output) as f:
+      for m in re.finditer(r'indexRange="(\d+)-(\d+)"', f.read()):
+        ranges.append((int(m.group(1)), int(m.group(2))))
+    return ranges
+
+  # ---------------------------------------------------------------------------
+  # Tests
+  # ---------------------------------------------------------------------------
+
+  def testTwoPassDefault_TempFilesObservedDuringPackaging(self):
+    """Default two-pass path must write packager-tempfile-* to --temp_dir.
+
+    The temp files exist for the full duration of the first pass (one per
+    output stream), so the background monitor — polling every 5 ms — should
+    always catch them even on fast machines.
+    """
+    return_code, snapshots = self._RunWithTempDirMonitor(
+        self._Streams(), self._Flags(single_pass=False))
+
+    self.assertEqual(return_code, 0, 'Packager failed unexpectedly')
+    self.assertTrue(
+        snapshots,
+        'Expected temp files in --temp_dir during two-pass packaging but '
+        'none were observed. Snapshots: %s' % snapshots)
+
+    # Verify the naming convention matches what file_util.cc produces.
+    all_files = [f for snapshot in snapshots for f in snapshot]
+    self.assertTrue(
+        any('packager-tempfile-' in f for f in all_files),
+        'Observed files do not look like packager temp files: %s' % all_files)
+
+    # After completion the packager must clean up — no residual temp files.
+    self.assertEqual(
+        os.listdir(self.monitored_tmp_dir), [],
+        'Temp files were not cleaned up after two-pass packaging')
+
+  def testSinglePassVod_NoTempFilesCreated(self):
+    """--mp4_single_pass_vod must not write any files to --temp_dir."""
+    return_code, snapshots = self._RunWithTempDirMonitor(
+        self._Streams(), self._Flags(single_pass=True))
+
+    self.assertEqual(return_code, 0, 'Packager failed unexpectedly')
+    self.assertFalse(
+        snapshots,
+        '--mp4_single_pass_vod wrote unexpected files to --temp_dir: %s' %
+        snapshots)
+    self.assertEqual(
+        os.listdir(self.monitored_tmp_dir), [],
+        '--temp_dir is not empty after single-pass packaging')
+
+  def testSinglePassVodCenc_NoTempFilesCreated(self):
+    """--mp4_single_pass_vod with CENC encryption must not write temp files."""
+    return_code, snapshots = self._RunWithTempDirMonitor(
+        self._Streams(), self._Flags(single_pass=True, encryption=True))
+
+    self.assertEqual(return_code, 0, 'Packager failed unexpectedly')
+    self.assertFalse(
+        snapshots,
+        '--mp4_single_pass_vod (CENC) wrote unexpected files to --temp_dir: '
+        '%s' % snapshots)
+
+  def testSinglePassVod_OutputLargerByReservation(self):
+    """Single-pass output must be larger than two-pass by ~kReservedSidxSize.
+
+    The single-pass path reserves 64 KB for the sidx placeholder free box per
+    stream. For a two-stream job (audio + video) the total overhead is ~128 KB.
+    We assert each single-pass output file is individually larger than its
+    two-pass counterpart, since each stream gets its own reservation.
+    """
+    self._RunWithTempDirMonitor(
+        self._Streams(), self._Flags(single_pass=False))
+    two_pass_sizes = {
+        'video.mp4': os.path.getsize(
+            os.path.join(self.tmp_dir, 'video.mp4')),
+        'audio.mp4': os.path.getsize(
+            os.path.join(self.tmp_dir, 'audio.mp4')),
+    }
+
+    # Re-run single-pass into a fresh output directory.
+    single_pass_tmp = tempfile.mkdtemp()
+    try:
+      streams = [
+          'input={0},stream=video,output={1}'.format(
+              self.test_file,
+              os.path.join(single_pass_tmp, 'video.mp4')),
+          'input={0},stream=audio,output={1}'.format(
+              self.test_file,
+              os.path.join(single_pass_tmp, 'audio.mp4')),
+      ]
+      flags = [
+          '--mpd_output', os.path.join(single_pass_tmp, 'output.mpd'),
+          '--temp_dir', self.monitored_tmp_dir,
+          '--single_threaded',
+          '--segment_duration=1',
+          '--mp4_single_pass_vod',
+          '--test_packager_version', '<tag>-<hash>-<test>',
+      ]
+      cmd = [self.packager.packager_binary] + streams + flags
+      self.assertEqual(subprocess.call(cmd, env=self.packager.GetEnv()), 0)
+
+      for name, two_pass_size in two_pass_sizes.items():
+        sp_size = os.path.getsize(os.path.join(single_pass_tmp, name))
+        self.assertGreater(
+            sp_size, two_pass_size,
+            'Single-pass %s (%d B) should be larger than two-pass (%d B) '
+            'due to sidx free-box reservation' % (name, sp_size, two_pass_size))
+    finally:
+      shutil.rmtree(single_pass_tmp, ignore_errors=True)
+
+  def testSinglePassVod_MpdIndexRangesWithinFileBounds(self):
+    """MPD indexRange byte offsets must lie within the actual output files."""
+    return_code, _ = self._RunWithTempDirMonitor(
+        self._Streams(), self._Flags(single_pass=True))
+    self.assertEqual(return_code, 0)
+
+    index_ranges = self._ParseMpdIndexRange()
+    self.assertTrue(index_ranges, 'No indexRange found in MPD')
+
+    for stream_name in ('video.mp4', 'audio.mp4'):
+      file_size = os.path.getsize(os.path.join(self.tmp_dir, stream_name))
+      for start, end in index_ranges:
+        self.assertGreaterEqual(start, 0)
+        self.assertLess(
+            end, file_size,
+            'indexRange end byte %d exceeds file size %d for %s' %
+            (end, file_size, stream_name))
+        self.assertLess(start, end)
 
 
 if __name__ == '__main__':

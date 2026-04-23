@@ -46,6 +46,20 @@ applied to VP9 in the same way.
 The above packaging command creates five single track fragmented mp4 streams
 (4 video, 1 audio), a subtitle file and a manifest, which describes the streams.
 
+.. note::
+
+    By default, on-demand packaging uses a two-pass approach: media data is
+    first written to a temporary file (in the system temp directory, e.g.
+    ``/tmp``), then copied to the final output once ``moov`` and ``sidx``
+    sizes are known. This requires approximately 2× the output size in
+    temporary disk space.
+
+    Add ``--mp4_single_pass_vod`` to write fragments directly to the output
+    file in a single pass, eliminating the temporary file and roughly halving
+    peak disk usage. This is recommended for large VOD files on local disk.
+    See ``--temp_dir`` if you need to control where the temporary file is
+    written when not using single-pass mode.
+
 * on-demand with trick-play tracks::
 
     $ packager \

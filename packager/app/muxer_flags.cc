@@ -56,6 +56,19 @@ ABSL_FLAG(bool,
           mp4_include_pssh_in_stream,
           true,
           "MP4 only: include pssh in the encrypted stream.");
+ABSL_FLAG(bool,
+          mp4_single_pass_vod,
+          false,
+          "MP4 on-demand only: write media fragments directly to the output "
+          "file in a single pass, reserving space for moov and sidx upfront "
+          "and patching them in-place at finalize. Eliminates the temporary "
+          "file and second-pass copy, halving peak disk usage during "
+          "packaging. Falls back to the default two-pass approach for "
+          "non-seekable outputs such as HTTP PUT. When false (default), the "
+          "original two-pass behavior is used and --temp_dir controls where "
+          "the intermediate file is written. Has no effect for non-MP4 "
+          "container formats (e.g. WebM); those containers are unaffected "
+          "by this flag.");
 ABSL_FLAG(int32_t,
           transport_stream_timestamp_offset_ms,
           100,

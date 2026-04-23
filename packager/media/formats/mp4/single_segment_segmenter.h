@@ -7,6 +7,8 @@
 #ifndef PACKAGER_MEDIA_FORMATS_MP4_SINGLE_SEGMENT_SEGMENTER_H_
 #define PACKAGER_MEDIA_FORMATS_MP4_SINGLE_SEGMENT_SEGMENTER_H_
 
+#include <cstdint>
+
 #include <packager/file/file_closer.h>
 #include <packager/macros/classes.h>
 #include <packager/media/event/muxer_listener.h>
@@ -47,6 +49,21 @@ class SingleSegmentSegmenter : public Segmenter {
   Status DoFinalizeSegment(int64_t segment_number) override;
 
   std::unique_ptr<SegmentIndex> vod_sidx_;
+
+  // In-place write path: fragments are written directly to the output file.
+  // Used for seekable outputs (local files). moov is pre-written at init with
+  // a placeholder duration and patched in-place at finalize. sidx is written
+  // into a reserved free-box region so no temp file or second pass is needed.
+  bool use_in_place_write_ = false;
+  std::unique_ptr<File, FileCloser> output_file_;
+  uint64_t moov_offset_ = 0;
+  size_t moov_size_at_init_ = 0;
+  uint64_t sidx_reserved_offset_ = 0;
+  uint64_t media_start_offset_ = 0;
+
+  // Temp-file fallback path: used for non-seekable outputs (e.g. HTTP PUT).
+  // Media data is buffered in a temp file during the first pass; DoFinalize
+  // writes the final headers then copies the temp data to the output.
   std::string temp_file_name_;
   std::unique_ptr<File, FileCloser> temp_file_;
 

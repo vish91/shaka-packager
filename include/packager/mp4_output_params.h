@@ -26,6 +26,22 @@ struct Mp4OutputParams {
   /// and mdat atom. Each chunk is uploaded immediately upon creation,
   /// decoupling latency from segment duration.
   bool low_latency_dash_mode = false;
+  /// Enable single-pass DASH on-demand packaging for MP4 (ISO-BMFF) outputs
+  /// only. When true and the output is a seekable local file, media fragments
+  /// are written directly to the output file in a single pass: moov is
+  /// pre-written with a reserved region for sidx, and both are patched
+  /// in-place at finalize. This eliminates the temporary file and the
+  /// second-pass copy that the default two-pass approach requires, halving
+  /// the required disk space during packaging.
+  ///
+  /// Falls back transparently to the two-pass approach for non-seekable
+  /// outputs (e.g. HTTP PUT). When false (default), the original two-pass
+  /// behavior is used and temp_dir controls where the intermediate file is
+  /// written.
+  ///
+  /// Has no effect for non-MP4 container formats (e.g. WebM). WebM on-demand
+  /// packaging always uses its own two-pass approach regardless of this flag.
+  bool single_pass_vod = false;
 };
 
 }  // namespace shaka
